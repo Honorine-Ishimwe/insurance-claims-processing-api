@@ -1,168 +1,206 @@
 # Insurance Claims Processing API
 
+[![CI Build & Test](https://github.com/Honorine-Ishimwe/insurance-claims-processing-api/actions/workflows/ci.yml/badge.svg)](https://github.com/Honorine-Ishimwe/insurance-claims-processing-api/actions/workflows/ci.yml)
 [![Java 21](https://img.shields.io/badge/Java-21-orange.svg)](https://openjdk.org/projects/jdk/21/)
 [![Spring Boot](https://img.shields.io/badge/Spring%20Boot-4.1.2-brightgreen.svg)](https://spring.io/projects/spring-boot)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16-blue.svg)](https://www.postgresql.org/)
-[![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-A production-grade, domain-driven REST API for health and medical insurance claim adjudication. Built with **Java 21**, **Spring Boot**, **Spring Data JPA**, **PostgreSQL**, and **Docker**.
+A production-ready, domain-driven **Java 21 / Spring Boot REST API** for health insurance claim adjudication. Members submit claims, adjusters review and adjudicate them through a Strategy-pattern rules engine and exact `BigDecimal` benefit calculator, and administrators manage users, policies, covered CPT codes, and an append-only audit trail.
 
 ---
 
-## Resume Highlights
+## Table of Contents
 
-- **Built a claims REST API** with a Strategy-pattern rules engine (`Eligibility`, `Coverage`, `DuplicateClaim`, `TimelyFiling`), strict claim lifecycle state machine (HTTP 409), paginated list endpoints, and an append-only audit trail with `X-Request-Id` correlation.
-- **Implemented benefit calculations** (deductible, coinsurance, annual maximum) using precise decimal arithmetic (`BigDecimal`, `HALF_UP`), secured with Spring Security, HS256 JWT, RBAC (`MEMBER`, `ADJUSTER`, `ADMIN`), immediate account-disable token revocation, and per-IP auth rate limiting.
-- **Wrote 94 JUnit 5 and Mockito tests** covering boundary edge cases, production safety checks, rate limiting, and end-to-end HTTP flows; packaged with Spring Boot Actuator, structured ECS JSON logging, multi-profile Docker Compose (`dev` vs `prod`), and GitHub Actions CI.
+- [Key Features](#key-features)
+- [Architecture](#architecture)
+- [Claim Lifecycle](#claim-lifecycle)
+- [API Reference](#api-reference)
+- [Quickstart](#quickstart)
+- [End-to-End Walkthrough](#end-to-end-walkthrough)
+- [Environment Configuration](#environment-configuration)
+- [Testing](#testing)
 
 ---
 
 ## Key Features
 
-1. **Strategy-Pattern Rules Engine**:
-   - `EligibilityRule`: Validates that the policy is `ACTIVE` and the date of service falls inside the policy coverage term (`startDate` to `endDate`, both ends inclusive).
-   - `CoverageRule`: Verifies procedure / CPT service code exists in the catalog and is covered.
-   - `DuplicateClaimRule`: Rejects duplicate submissions for identical member, provider, service code, date, and billed amount.
-   - `TimelyFilingRule`: Enforces the 90-day filing window (`submissionDate <= serviceDate + 90 days`).
-   - **Composite aggregation**: Collects and reports *all* failed rules rather than failing silently on the first one.
-
-2. **Claim Lifecycle State Machine**:
-   - `SUBMITTED` $\rightarrow$ `IN_REVIEW` $\rightarrow$ `APPROVED` or `DENIED` $\rightarrow$ `PAID`.
-   - `DENIED` and `PAID` are terminal states.
-   - Any invalid state transition (such as skipping review or paying a denied claim) is blocked at both the domain model and API layers with an RFC 9457 `409 Conflict` response.
-
-3. **Financial Benefit Calculation Engine**:
-   - Pure, stateless `BenefitCalculator` operating entirely on `BigDecimal` with scale 2 and `RoundingMode.HALF_UP`.
-   - Sequential adjudication pipeline:
-     1. **Deductible applied**: `min(billedAmount, remainingDeductible)`
-     2. **Coinsurance split**: `amountAfterDeductible * coinsuranceRate` (e.g., 80% plan / 20% member)
-     3. **Annual Maximum cap**: Plan payout is capped at `remainingAnnualMaximum`; any excess flows to member responsibility.
-   - **Reconciliation invariant**: `deductibleApplied + coinsuranceAmount + overMaxAmount + planPays == billedAmount`.
-   - **Atomic accumulator updates**: Approving a claim updates the policy's `deductibleMet` and `benefitsPaidYtd` in the same database transaction.
-
-4. **Security & Role-Based Access Control (RBAC)**:
-   - Stateless JWT authentication via Spring Security's OAuth2 Resource Server (Nimbus HS256) with immediate token revocation when an account is disabled.
-   - Per-IP brute-force rate limiting on `/api/v1/auth/login` and `/api/v1/auth/register` (`429 Too Many Requests` + `Retry-After`).
-   - `ROLE_MEMBER`: Can self-register (`POST /api/v1/auth/register`), view their own policies (`GET /api/v1/me/policies`), and submit/view their own claims.
-   - `ROLE_ADJUSTER`: Can access the paginated claim queue, initiate reviews, trigger rules engine adjudication, and authorize payouts.
-   - `ROLE_ADMIN`: Can manage users (`/api/v1/admin/users`), issue/update policies (`/api/v1/admin/policies`), manage the CPT service catalog (`/api/v1/admin/covered-services`), query the audit trail (`/api/v1/admin/audit-events`), and read Actuator metrics.
-
-5. **Operations & Production Hardening**:
-   - **No hardcoded secrets in base/prod config**: `ProductionSafetyCheck` fails fast on startup if `prod` is combined with `dev`/`test` or uses a publicly known key.
-   - **Separated demo seed data**: `db/demo/R__demo_data.sql` only runs under the `dev`/`test` profiles; `prod` runs only schema + reference CPT catalog migrations.
-   - **Observability**: Spring Boot Actuator (`/actuator/health`, `/actuator/health/liveness`, `/actuator/health/readiness`, `/actuator/info`, `/actuator/metrics`), `X-Request-Id` correlation header, ECS JSON structured logging in `prod`, and a database-backed `audit_event` table.
-   - **Clean API & Error Handling**: Bean Validation, RFC 9457 `ProblemDetail` responses, `PageResponse` pagination (`?page=&size=`), and OpenAPI 3 / Swagger UI (disabled by default in `prod`).
+- **Strategy-Pattern Rules Engine**: Evaluates every claim against 4 independent rules and returns *all* pass/fail reasons instead of failing on the first error:
+  - `EligibilityRule` — Policy is `ACTIVE` and date of service is within `startDate..endDate` (inclusive).
+  - `CoverageRule` — Procedure/CPT code exists in `covered_service` and is covered.
+  - `DuplicateClaimRule` — Rejects non-denied duplicates for the same member, provider, service code, date, and billed amount.
+  - `TimelyFilingRule` — Enforces the 90-day filing window (`submissionDate <= serviceDate + 90 days`).
+- **Strict Claim State Machine**: Enforces `SUBMITTED → IN_REVIEW → APPROVED / DENIED → PAID` at the enum, entity, service, and database `CHECK` constraint layers. Invalid transitions return RFC 9457 `409 Conflict`.
+- **Exact Financial Benefit Calculator**: Stateless `BigDecimal` (`scale=2`, `HALF_UP`) adjudication applying remaining deductible, coinsurance split, and annual maximum cap while updating policy YTD accumulators atomically in the same `@Transactional` boundary.
+- **Security & RBAC**:
+  - Stateless HS256 JWT authentication via Spring Security OAuth2 Resource Server.
+  - Three roles: `MEMBER`, `ADJUSTER`, and `ADMIN`.
+  - Immediate JWT revocation when an admin disables an account.
+  - Per-IP brute-force rate limiting (`429 Too Many Requests` + `Retry-After`) on `/api/v1/auth/login` and `/register`.
+  - Multi-tenant member isolation (unauthorized policy/claim lookups return `404` to prevent enumeration).
+- **Production Hardening & Observability**:
+  - Append-only `audit_event` table + dedicated `AUDIT` logger with `X-Request-Id` correlation on every request.
+  - Spring Boot Actuator (`/actuator/health`, `/actuator/health/liveness`, `/actuator/health/readiness`, `/actuator/info`, `/actuator/metrics`).
+  - `ProductionSafetyCheck` fails fast on boot if `prod` is combined with `dev`/`test` or uses a known dev/test JWT secret.
+  - Paginated list endpoints (`PageResponse` with `?page=&size=`, capped at 100) and structured ECS JSON logs in `prod`.
 
 ---
 
-## Architecture & Design Decisions
+## Architecture
 
-### 1. Why the Strategy Pattern for the Rules Engine?
-- **Open-Closed Principle (OCP)**: Adjudication rules in health insurance evolve constantly (e.g., pre-authorization requirements, out-of-network penalties, fraud scoring). With the Strategy pattern, each rule is an independent, single-responsibility Spring bean implementing `ClaimRule`. Adding a new rule requires authoring a single class without touching existing rules or the engine runner.
-- **Testability**: Each rule strategy is independently testable in isolation using plain unit tests without booting up Spring or mocking complex service webs.
-- **Auditability & Full Diagnostics**: Rather than short-circuiting with nested `if/else` checks, the engine iterates through all configured strategies and produces a unified `RulesEvaluation` containing the individual pass/fail status and explanatory reason for every rule.
+Organized **package-by-feature** with a clean layered flow (`Security Filter Chain → Controller → Service / Rules & Benefit Engines → JPA Repository → PostgreSQL`):
 
-### 2. Why `BigDecimal` for Benefit Calculations?
-- **Avoid Binary Floating-Point Errors**: Standard `double` and `float` types use IEEE 754 floating-point representation, which cannot accurately represent decimal fractions (e.g., `0.1 + 0.2 = 0.30000000000000004`). In insurance and financial systems, fractional cent discrepancies accumulate into balance errors and regulatory violations.
-- **Controlled Rounding**: All monetary figures are maintained at scale 2 using `RoundingMode.HALF_UP`. Rounding is performed once on the plan share, and the member's responsibility is computed by exact subtraction (`billedAmount - planPays`), guaranteeing that the sum of the components always reconciles to the exact penny.
-- **Pure Function Architecture**: `BenefitCalculator` takes a plain record (`BenefitInput`) and returns a plain record (`BenefitResult`). It has zero repository or database dependencies, enabling instantaneous unit testing of complex boundary scenarios.
-
-### 3. Why Finite State Transitions on the Claim Lifecycle?
-- **Fraud & Double-Payment Prevention**: Permitting arbitrary status changes allows illegal operations—such as paying an unreviewed claim, re-paying a settled claim, or approving an already denied claim.
-- **Defense in Depth**: The transition rules are defined in the `ClaimStatus` enum (`allowedNext()`), checked inside the `Claim` domain entity (`transitionTo()`), guarded inside `ClaimService`, and enforced via database `CHECK` constraints. Any violation produces an informative `409 Conflict` error indicating the current status, requested status, and permitted next states.
-
-### 4. Real-time Policy Accumulator Updates
-- Insurance policies operate over a plan year. Each approved claim reduces the member's remaining annual deductible and claims against their annual maximum.
-- In `ClaimService.adjudicate()`, the claim status transition, benefit assignment, and `Policy` accumulator increments (`deductibleMet += deductibleApplied`, `benefitsPaidYtd += planPaid`) execute inside a single `@Transactional` boundary, preventing race conditions and stale accumulator reads on subsequent claims.
-
-### 5. Multi-Tenant Member Isolation
-- A member cannot view, modify, or submit claims against a policy owned by another user.
-- If a member attempts to access an unauthorized policy or claim ID, the API returns `404 Not Found` (rather than `403 Forbidden`) to prevent enumeration attacks and avoid leaking the existence of other members' policies.
-
----
-
-## Domain State Machine
-
+```text
+src/main/java/com/claims/api/
+├── admin/       # AdminController (users, policies, CPT catalog, audit log)
+├── audit/       # AuditEvent entity, AuditAction enum, AuditService
+├── benefit/     # Pure BigDecimal BenefitCalculator + BenefitInput / BenefitResult
+├── claim/       # MemberClaimController, AdjusterClaimController, ClaimService, Claim, ClaimStatus, DTOs
+├── common/      # GlobalExceptionHandler (RFC 9457), RequestIdFilter, PageResponse, PageParams
+├── config/      # AppConfig (OpenAPI, Clock), ProductionSafetyCheck, BootstrapAdminRunner
+├── policy/      # MemberPolicyController, PolicyService, Policy, CoveredService, DTOs
+├── rules/       # ClaimRulesEngine + ClaimRule implementations (Eligibility, Coverage, Duplicate, TimelyFiling)
+├── security/    # SecurityConfig, AuthController, TokenService, AuthRateLimitFilter
+└── user/        # UserService, AppUser, Role, DTOs
 ```
+
+---
+
+## Claim Lifecycle
+
+```text
    [SUBMITTED]
-        |
-        v  (Adjuster starts review)
+        │
+        ▼  POST /api/v1/adjuster/claims/{id}/review
    [IN_REVIEW]
-      /     \
-(pass)       (fail)
-    v         v
-[APPROVED]   [DENIED] (Terminal)
-    |
-    v  (Disburse payout)
-  [PAID] (Terminal)
+      ╱   ╲
+ (pass)   (fail)
+    ▼       ▼
+[APPROVED] [DENIED] (terminal)
+    │
+    ▼  POST /api/v1/adjuster/claims/{id}/pay
+  [PAID] (terminal)
 ```
 
 ---
 
-## Seed Data & Demo Credentials (`dev` profile only)
+## API Reference
 
-When running with `SPRING_PROFILES_ACTIVE=dev` (the default in `docker-compose.yml`), Flyway seeds demo accounts (password for all is `password`):
+Interactive OpenAPI 3 / Swagger UI is available in `dev` at [http://localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html) (disabled by default in `prod`).
 
-| Username | Password | Role | Description |
-| :--- | :--- | :--- | :--- |
-| `member1` | `password` | `MEMBER` | Insured member with active policy `POL-1001` ($500 deductible, $10,000 max) |
-| `member2` | `password` | `MEMBER` | Insured member with policy `POL-1002` ($100 remaining annual max) |
-| `adjuster1` | `password` | `ADJUSTER` | Claims adjuster who reviews and adjudicates submitted claims |
-| `admin1` | `password` | `ADMIN` | Administrator who manages users, policies, CPT codes and reads the audit log |
+### Authentication (Public, Rate Limited)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/api/v1/auth/register` | Self-register a new `MEMBER` account |
+| `POST` | `/api/v1/auth/login` | Authenticate with username/password and receive a JWT |
+
+### Member (`ROLE_MEMBER`)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/v1/me/policies` | List own policies with remaining deductible & annual maximum |
+| `POST` | `/api/v1/claims` | Submit a new claim (`SUBMITTED`) |
+| `GET` | `/api/v1/claims?page=0&size=20` | List own claims, newest first (paginated) |
+| `GET` | `/api/v1/claims/{id}` | View a single claim and its benefit breakdown |
+
+### Adjuster (`ROLE_ADJUSTER`)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `GET` | `/api/v1/adjuster/claims?status=SUBMITTED&page=0&size=20` | List/filter claim queue (paginated) |
+| `GET` | `/api/v1/adjuster/claims/{id}` | View any claim |
+| `POST` | `/api/v1/adjuster/claims/{id}/review` | Transition `SUBMITTED → IN_REVIEW` |
+| `POST` | `/api/v1/adjuster/claims/{id}/adjudicate` | Run rules engine & benefit math (`APPROVED` or `DENIED`) |
+| `POST` | `/api/v1/adjuster/claims/{id}/pay` | Disburse payout (`APPROVED → PAID`) |
+
+### Administration (`ROLE_ADMIN`)
+
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/api/v1/admin/users` | Create a user of any role (`MEMBER`, `ADJUSTER`, `ADMIN`) |
+| `GET` | `/api/v1/admin/users?role=&page=0&size=20` | List users, optionally filtered by role |
+| `GET` | `/api/v1/admin/users/{id}` | Get user details |
+| `PATCH` | `/api/v1/admin/users/{id}/enabled` | Enable or disable a user (revokes active JWTs immediately) |
+| `POST` | `/api/v1/admin/policies` | Issue a new policy to an existing `MEMBER` |
+| `GET` | `/api/v1/admin/policies?status=&page=0&size=20` | List policies, optionally filtered by status |
+| `GET` | `/api/v1/admin/policies/{policyNumber}` | Get policy details and YTD accumulators |
+| `PATCH` | `/api/v1/admin/policies/{policyNumber}/status` | Update policy status (`ACTIVE`, `LAPSED`, `CANCELLED`) |
+| `GET` | `/api/v1/admin/covered-services?page=0&size=20` | List the CPT service catalog |
+| `PUT` | `/api/v1/admin/covered-services/{serviceCode}` | Create or update a 5-digit CPT service code |
+| `GET` | `/api/v1/admin/audit-events?entityType=&entityId=&actor=` | Query the append-only audit trail |
+
+### Operations
+
+| Method | Endpoint | Access |
+| :--- | :--- | :--- |
+| `GET` | `/actuator/health`, `/actuator/health/liveness`, `/actuator/health/readiness`, `/actuator/info` | Public |
+| `GET` | `/actuator/metrics` | `ROLE_ADMIN` |
 
 ---
 
 ## Quickstart
 
-### Option A: Local Development via Docker Compose (Recommended)
+### 1. Local Development (Docker Compose)
 
-1. Start PostgreSQL and the API (`dev` profile):
-   ```bash
-   docker compose up --build
-   ```
-2. Open Swagger UI in your browser:
-   [http://localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html)
+Runs PostgreSQL 16 and the API with `SPRING_PROFILES_ACTIVE=dev` (seeds demo users and enables Swagger UI):
 
-### Option B: Production Deployment via Docker Compose
-
-1. Copy `.env.example` to `.env` and fill in real secrets (`JWT_SECRET`, `DB_PASSWORD`, `BOOTSTRAP_ADMIN_PASSWORD`).
-2. Start the production stack (`prod` profile, no demo users, Postgres internal-only):
-   ```bash
-   docker compose -f docker-compose.prod.yml --env-file .env up -d --build
-   ```
-3. After the first boot creates the bootstrap admin, remove `BOOTSTRAP_ADMIN_*` from `.env` and place a TLS-terminating reverse proxy (Nginx, Caddy, Cloudflare, or cloud load balancer) in front of port `8080`.
-
-### Option C: Run Locally with Maven
-
-1. Start PostgreSQL (e.g., `docker compose up postgres -d`).
-2. Run the application with the `dev` profile:
-   ```bash
-   SPRING_PROFILES_ACTIVE=dev ./mvnw spring-boot:run
-   ```
-
-### Running Tests
-
-Execute the 94 unit and integration tests:
 ```bash
-./mvnw clean test
+docker compose up --build
 ```
+
+Open Swagger UI at [http://localhost:8080/swagger-ui.html](http://localhost:8080/swagger-ui.html).
+
+#### Demo Credentials (`dev` profile only)
+
+| Username | Password | Role | Notes |
+| :--- | :--- | :--- | :--- |
+| `member1` | `password` | `MEMBER` | Active policy `POL-1001` ($500 deductible, 80% coinsurance, $10,000 max) + lapsed `POL-1003` |
+| `member2` | `password` | `MEMBER` | Active policy `POL-1002` (deductible met, $100 remaining annual max) |
+| `adjuster1` | `password` | `ADJUSTER` | Reviews, adjudicates, and pays claims |
+| `admin1` | `password` | `ADMIN` | Manages users, policies, CPT codes, and reads the audit log |
+
+### 2. Local Development (Maven)
+
+```bash
+docker compose up postgres -d
+SPRING_PROFILES_ACTIVE=dev ./mvnw spring-boot:run
+```
+
+### 3. Production Deployment (Docker Compose)
+
+Production runs with `SPRING_PROFILES_ACTIVE=prod` (no demo users, Swagger disabled, ECS JSON logs, PostgreSQL internal-only):
+
+```bash
+cp .env.example .env
+# Generate strong secrets and paste them into .env:
+openssl rand -base64 48   # JWT_SECRET
+openssl rand -base64 24   # DB_PASSWORD
+```
+
+Set `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` (12+ chars) in `.env`, then start:
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env up -d --build
+```
+
+After the first boot creates the initial admin account, remove `BOOTSTRAP_ADMIN_*` from `.env` and place a TLS-terminating reverse proxy (Nginx, Caddy, Cloudflare, or cloud load balancer) in front of port `8080`.
 
 ---
 
-## API Walkthrough
+## End-to-End Walkthrough
 
-### 1. Authenticate as a Member
+With the local `dev` stack running:
+
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/auth/login \
+# 1. Log in as member1
+MEMBER_TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"member1","password":"password"}'
-```
-*Copy the `accessToken` from the JSON response.*
+  -d '{"username":"member1","password":"password"}' | jq -r .accessToken)
 
-### 2. Submit a Claim
-```bash
-curl -s -X POST http://localhost:8080/api/v1/claims \
-  -H "Authorization: Bearer <MEMBER_TOKEN>" \
+# 2. Submit a $1,000 claim against POL-1001
+CLAIM_ID=$(curl -s -X POST http://localhost:8080/api/v1/claims \
+  -H "Authorization: Bearer $MEMBER_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "policyNumber": "POL-1001",
@@ -170,49 +208,61 @@ curl -s -X POST http://localhost:8080/api/v1/claims \
     "serviceCode": "99213",
     "serviceDate": "2026-10-01",
     "billedAmount": 1000.00
-  }'
-```
+  }' | jq -r .id)
 
-### 3. Authenticate as an Adjuster
-```bash
-curl -s -X POST http://localhost:8080/api/v1/auth/login \
+# 3. Log in as adjuster1
+ADJUSTER_TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"adjuster1","password":"password"}'
-```
+  -d '{"username":"adjuster1","password":"password"}' | jq -r .accessToken)
 
-### 4. Move Claim to IN_REVIEW
-```bash
-curl -s -X POST http://localhost:8080/api/v1/adjuster/claims/1/review \
-  -H "Authorization: Bearer <ADJUSTER_TOKEN>"
-```
+# 4. Start review -> Adjudicate ($500 deductible, $400 plan payout, $600 member share) -> Pay
+curl -s -X POST "http://localhost:8080/api/v1/adjuster/claims/$CLAIM_ID/review" \
+  -H "Authorization: Bearer $ADJUSTER_TOKEN"
 
-### 5. Adjudicate Claim (Rules Engine + Payment Math)
-```bash
-curl -s -X POST http://localhost:8080/api/v1/adjuster/claims/1/adjudicate \
-  -H "Authorization: Bearer <ADJUSTER_TOKEN>"
-```
-*Response shows all 4 passing rule evaluations and the benefit breakdown ($500 deductible applied, $400 plan payout, $600 member responsibility).*
+curl -s -X POST "http://localhost:8080/api/v1/adjuster/claims/$CLAIM_ID/adjudicate" \
+  -H "Authorization: Bearer $ADJUSTER_TOKEN" | jq
 
-### 6. Disburse Payment
-```bash
-curl -s -X POST http://localhost:8080/api/v1/adjuster/claims/1/pay \
-  -H "Authorization: Bearer <ADJUSTER_TOKEN>"
+curl -s -X POST "http://localhost:8080/api/v1/adjuster/claims/$CLAIM_ID/pay" \
+  -H "Authorization: Bearer $ADJUSTER_TOKEN" | jq
 ```
 
 ---
 
-## Test Suite Coverage
+## Environment Configuration
 
-The test suite contains **94 automated tests**:
-- **`ClaimStatusTest` (21 tests)**: Parameterized test verifying all 25 pairs in the status transition matrix; terminal state checks.
-- **`BenefitCalculatorTest` (23 tests)**: Deductible boundaries, partial deductible, annual maximum cap, fractional cent rounding, and mathematical reconciliation invariant.
-- **`EligibilityRuleTest` (6 tests)**: Active status, incident on first day, incident on exact last day of coverage, incident day after expiration.
-- **`TimelyFilingRuleTest` (9 tests)**: Window boundary checks (day 89, day 90 pass, day 91 fail), leap-year calculations.
-- **`CoverageRuleTest` (3 tests)**: Covered code, excluded code, unknown code.
-- **`DuplicateClaimRuleTest` (3 tests)**: Detection of identical claims; self-exclusion check.
-- **`ClaimRulesEngineTest` (3 tests)**: Multi-rule aggregation and ordering.
-- **`ClaimServiceTest` (5 tests)**: Unit testing service transactions, accumulator updates, and permission guards.
-- **`AuthRateLimitFilterTest` (2 tests)**: Per-IP window throttling, `429` + `Retry-After`, and window reset.
-- **`ProductionSafetyCheckTest` (3 tests)**: Fail-fast rejection of `prod`+`dev` or known public JWT secrets.
-- **`BootstrapAdminRunnerTest` (3 tests)**: First-boot admin creation, idempotency, and password length guard.
-- **`ClaimsApiIntegrationTest` (13 tests)**: End-to-end HTTP integration tests covering JWT auth, self-registration, RBAC, immediate token revocation on user disable, admin policy/catalog/audit endpoints, pagination, Actuator probes/metrics, member isolation, and error payloads.
+See [`.env.example`](.env.example) for all supported variables. Key settings:
+
+| Variable | Required in `prod` | Description |
+| :--- | :--- | :--- |
+| `DB_URL`, `DB_USERNAME`, `DB_PASSWORD` | Yes | PostgreSQL connection settings |
+| `JWT_SECRET` | Yes | Base64-encoded HS256 secret (≥ 32 bytes decoded) |
+| `JWT_TTL_MINUTES` | No (default `60`) | Access token lifetime |
+| `BOOTSTRAP_ADMIN_USERNAME` / `_PASSWORD` | First boot only | Seeds one `ADMIN` if none exists |
+| `CORS_ALLOWED_ORIGINS` | No | Comma-separated allowed browser origins |
+| `RATE_LIMIT_MAX_REQUESTS` / `_WINDOW_SECONDS` | No (`10` / `60`) | Per-IP auth rate limit |
+| `SWAGGER_ENABLED` | No (`false` in `prod`) | Toggle OpenAPI / Swagger UI |
+
+---
+
+## Testing
+
+Run the full suite of **94 automated JUnit 5 & Mockito tests** (uses in-memory H2 in PostgreSQL compatibility mode with Flyway migrations):
+
+```bash
+./mvnw clean test
+```
+
+| Test Class | Tests | Coverage |
+| :--- | :---: | :--- |
+| `BenefitCalculatorTest` | 23 | Deductible boundaries, coinsurance, annual max cap, `HALF_UP` rounding, reconciliation invariant |
+| `ClaimStatusTest` | 21 | All 25 transition pairs in the claim state machine & terminal state checks |
+| `ClaimsApiIntegrationTest` | 13 | End-to-end HTTP flows: JWT auth, RBAC, self-registration, token revocation on disable, admin APIs, pagination, audit trail, Actuator, member isolation |
+| `TimelyFilingRuleTest` | 9 | 90-day boundary (day 89/90 pass, day 91 fail), leap-year dates |
+| `EligibilityRuleTest` | 6 | Policy status and coverage term boundary dates |
+| `ClaimServiceTest` | 5 | Transactional adjudication, accumulator updates, ownership checks |
+| `CoverageRuleTest` | 3 | Covered, excluded, and unknown CPT codes |
+| `DuplicateClaimRuleTest` | 3 | Duplicate detection and self-exclusion |
+| `ClaimRulesEngineTest` | 3 | Multi-rule evaluation and aggregation |
+| `ProductionSafetyCheckTest` | 3 | Rejects `prod`+`dev` and known public JWT secrets |
+| `BootstrapAdminRunnerTest` | 3 | First-boot admin creation, idempotency, password length guard |
+| `AuthRateLimitFilterTest` | 2 | Per-IP `429` throttling, `Retry-After`, and window reset |
