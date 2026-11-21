@@ -1,0 +1,26 @@
+# PRODUCTION. Activate with SPRING_PROFILES_ACTIVE=prod.
+# Requires DB_URL, DB_USERNAME, DB_PASSWORD and JWT_SECRET environment variables.
+spring:
+  flyway:
+    locations: classpath:db/migration   # schema + reference data only, never demo users
+
+server:
+  # Trust X-Forwarded-* headers from the reverse proxy / load balancer that terminates HTTPS,
+  # so client IPs (rate limiting, audit) and the https scheme are seen correctly.
+  forward-headers-strategy: native
+
+# Interactive API docs are off in production unless explicitly enabled.
+springdoc:
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:false}
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:false}
+
+# One JSON object per log line, ready for CloudWatch / Cloud Logging / Datadog / ELK.
+logging:
+  structured:
+    format:
+      console: ecs
+  level:
+    root: INFO
+    AUDIT: INFO

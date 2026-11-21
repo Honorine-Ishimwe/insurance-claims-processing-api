@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:claims;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DEFAULT_NULL_ORDERING=HIGH;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+  flyway:
+    locations: classpath:db/migration,classpath:db/demo
+
+security:
+  jwt:
+    secret: dGVzdC1vbmx5LWp3dC1zZWNyZXQtZm9yLXVuaXQtYW5kLWludGVncmF0aW9uLXRlc3Rz
+
+app:
+  rate-limit:
+    # The integration tests log in many times from 127.0.0.1; the limiter has its own unit test.
+    max-requests: 10000
